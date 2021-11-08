@@ -1,0 +1,116 @@
+name: CI
+on:
+  push:
+    branches: [ master, develop, staging, trying ]
+  pull_request:
+    branches: [ master ]
+defaults:
+  run:
+    shell: bash
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: full
+jobs:
+  rustfmt:
+    name: Checks / Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.52.0
+          override: true
+          components: rustfmt
+      - name: Run
+        run: cargo fmt --all -- --check
+  clippy:
+    name: Checks / Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.52.0
+          override: true
+          components: clippy
+      - name: Run
+        run: cargo clippy -- --deny warnings
+  cargo-deny:
+    name: Checks / Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: CacheKey (cargo-deny)
+        id: cache-key
+        run: echo "::set-output name=yyyymm::$(/bin/date -u "+%Y%m")"
+      - name: Cache (cargo-deny)
+        id: cache-cargo-deny
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ runner.os }}-${{ steps.cache-key.outputs.yyyymm }}
+      - name: Setup (cargo-deny)
+        if: steps.cache-cargo-deny.outputs.cache-hit != 'true'
+        run: cargo deny --version || cargo install cargo-deny --locked
+      - name: Run
+        run: cargo deny check --hide-inclusion-graph --show-stats
+  test:
+    name: Tests / Build & Test
+    needs: [ rustfmt, clippy, cargo-deny ]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - build: linux
+            os: ubuntu-latest
+            rust: 1.52.0  # Latest
+          - build: linux
+            os: ubuntu-latest
+            rust: 1.31.0  # MSRV
+      fail-fast: true
+      max-parallel: 3
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt, clippy
+      - name: Setup (nightly)
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+      - name: CacheKey (cargo-expand)
+        id: cache-key
+        run: echo "::set-output name=yyyymm::$(/bin/date -u "+%Y%m")"
+      - name: Cache (cargo-expand)
+        id: cache-cargo-expand
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo/bin/cargo-expand
+          key: ${{ runner.os }}-${{ steps.cache-key.outputs.yyyymm }}
+      - name: Setup (cargo-expand)
+        if: steps.cache-cargo-expand.outputs.cache-hit != 'true'
+        run: cargo expand --version || cargo +nightly install cargo-expand --locked
+      - name: Build
+        run: cargo build --verbose --all
+      - name: Test
+        run: cargo test --verbose --all
+      - name: Test Expand
+        run: .ci-scripts/test-expand
+  success:
+    name: Success
+    if: ${{ success() }}
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Succeed
+        run: exit 0

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Boyu Yang
+// Copyright (C) 2019-2021 Boyu Yang
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -6,22 +6,44 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Once,
+};
+
 use quote::quote;
-use syn::{parse::Result as ParseResult, spanned::Spanned as _, Error as SynError};
+use syn::{parse::Result as ParseResult, spanned::Spanned, Error as SynError};
 
 const ATTR_NAME: &str = "property";
 const SKIP: &str = "skip";
-const GET_TYPE_OPTIONS: (&str, Option<&[&str]>) = ("type", Some(&["ref", "copy", "clone"]));
-const SET_TYPE_OPTIONS: (&str, Option<&[&str]>) =
-    ("type", Some(&["ref", "own", "none", "replace"]));
 const NAME_OPTION: (&str, Option<&[&str]>) = ("name", None);
 const STRIP_OPTION: &[&str] = &["strip_option"];
 const PREFIX_OPTION: (&str, Option<&[&str]>) = ("prefix", None);
 const SUFFIX_OPTION: (&str, Option<&[&str]>) = ("suffix", None);
 const VISIBILITY_OPTIONS: &[&str] = &["disable", "public", "crate", "private"];
+const GET_TYPE_OPTIONS: (&str, Option<&[&str]>) = ("type", Some(&["auto", "ref", "copy", "clone"]));
+const SET_TYPE_OPTIONS: (&str, Option<&[&str]>) =
+    ("type", Some(&["ref", "own", "none", "replace"]));
+const SET_OPTION_FULL_OPTION: &[&str] = &["full_option"];
+const CLR_TYPE_OPTIONS: (&str, Option<&[&str]>) = ("scope", Some(&["auto", "option", "all"]));
 const SORT_TYPE_OPTIONS: &[&str] = &["asc", "desc"];
 
-pub(crate) struct PropertyDef {
+static INIT_DEFAULT: Once = Once::new();
+static mut CRATE_CONF: Option<FieldConf> = None;
+static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropertyType {
+    Crate,
+    Container,
+    Field,
+}
+
+pub(crate) struct CrateConfDef {
+    pub(crate) conf: FieldConf,
+}
+
+pub(crate) struct ContainerDef {
     pub(crate) name: syn::Ident,
     pub(crate) generics: syn::Generics,
     pub(crate) fields: Vec<FieldDef>,
@@ -35,7 +57,7 @@ pub(crate) struct FieldDef {
 
 #[derive(Clone, Copy)]
 pub(crate) enum GetTypeConf {
-    NotSet,
+    Auto,
     Ref,
     Copy_,
     Clone_,
@@ -47,6 +69,13 @@ pub(crate) enum SetTypeConf {
     Own,
     None_,
     Replace,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ClrScopeConf {
+    Auto,
+    Option_,
+    All,
 }
 
 #[derive(Clone, Copy)]
@@ -81,13 +110,20 @@ pub(crate) struct SetFieldConf {
     pub(crate) vis: VisibilityConf,
     pub(crate) name: MethodNameConf,
     pub(crate) typ: SetTypeConf,
-    pub(crate) strip_option: bool,
+    pub(crate) full_option: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct MutFieldConf {
     pub(crate) vis: VisibilityConf,
     pub(crate) name: MethodNameConf,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClrFieldConf {
+    pub(crate) vis: VisibilityConf,
+    pub(crate) name: MethodNameConf,
+    pub(crate) scope: ClrScopeConf,
 }
 
 #[derive(Clone)]
@@ -101,11 +137,54 @@ pub(crate) struct FieldConf {
     pub(crate) get: GetFieldConf,
     pub(crate) set: SetFieldConf,
     pub(crate) mut_: MutFieldConf,
+    pub(crate) clr: ClrFieldConf,
     pub(crate) ord: OrdFieldConf,
     pub(crate) skip: bool,
 }
 
-impl syn::parse::Parse for PropertyDef {
+impl syn::parse::Parse for CrateConfDef {
+    fn parse(input: syn::parse::ParseStream) -> ParseResult<Self> {
+        let attr_args =
+            syn::punctuated::Punctuated::<syn::NestedMeta, syn::Token![,]>::parse_terminated(
+                input,
+            )?;
+        let mut conf = FieldConf::default();
+        for nested_meta in attr_args.iter() {
+            parse_nested_meta(&mut conf, nested_meta, PropertyType::Crate)?;
+        }
+        Ok(Self { conf })
+    }
+}
+
+impl CrateConfDef {
+    pub(crate) fn set_default_conf(self) {
+        let Self { conf } = self;
+        let call_count = CALL_COUNT.load(Ordering::SeqCst);
+        unsafe {
+            if CRATE_CONF.is_some() {
+                panic!(
+                    "The default property for the whole crate should be \
+                     set only once for each crate."
+                );
+            } else if call_count > 0 {
+                panic!(
+                    "Some properties of containers or fields was set \
+                     before the default property for the whole crate has been taken effect."
+                );
+            }
+            INIT_DEFAULT.call_once(|| {
+                CRATE_CONF = Some(conf);
+            });
+        }
+    }
+
+    fn get_default_conf() -> FieldConf {
+        let _ = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe { CRATE_CONF.as_ref().map(ToOwned::to_owned) }.unwrap_or_else(Default::default)
+    }
+}
+
+impl syn::parse::Parse for ContainerDef {
     fn parse(input: syn::parse::ParseStream) -> ParseResult<Self> {
         let derive_input: syn::DeriveInput = input.parse()?;
         let attrs_span = derive_input.span();
@@ -120,7 +199,11 @@ impl syn::parse::Parse for PropertyDef {
         match data {
             syn::Data::Struct(data) => match data.fields {
                 syn::Fields::Named(named_fields) => {
-                    let conf = Self::parse_attrs(attrs_span, &attrs[..])?;
+                    let conf = ContainerDef::parse_attrs(
+                        attrs_span,
+                        CrateConfDef::get_default_conf(),
+                        &attrs[..],
+                    )?;
                     Ok(Self {
                         name: ident,
                         generics,
@@ -134,9 +217,13 @@ impl syn::parse::Parse for PropertyDef {
     }
 }
 
-impl PropertyDef {
-    fn parse_attrs(span: proc_macro2::Span, attrs: &[syn::Attribute]) -> ParseResult<FieldConf> {
-        Ok(parse_attrs(span, Default::default(), attrs, false)?)
+impl ContainerDef {
+    fn parse_attrs(
+        span: proc_macro2::Span,
+        conf: FieldConf,
+        attrs: &[syn::Attribute],
+    ) -> ParseResult<FieldConf> {
+        parse_attrs(span, conf, attrs, PropertyType::Container)
     }
 }
 
@@ -151,7 +238,7 @@ impl FieldDef {
             let syn::Field {
                 attrs, ident, ty, ..
             } = f.clone();
-            let conf = Self::parse_attrs(f.span(), conf.clone(), &attrs[..])?;
+            let conf = FieldDef::parse_attrs(f.span(), conf.clone(), &attrs[..])?;
             let ident = ident.ok_or_else(|| SynError::new(f.span(), "unreachable"))?;
             let field = Self { ident, ty, conf };
             fields.push(field);
@@ -168,7 +255,7 @@ impl FieldDef {
         conf: FieldConf,
         attrs: &[syn::Attribute],
     ) -> ParseResult<FieldConf> {
-        Ok(parse_attrs(span, conf, attrs, true)?)
+        parse_attrs(span, conf, attrs, PropertyType::Field)
     }
 }
 
@@ -179,9 +266,10 @@ impl GetTypeConf {
     ) -> ParseResult<Option<Self>> {
         let choice = match namevalue_params.get("type").map(AsRef::as_ref) {
             None => None,
-            Some("ref") => Some(Self::Ref),
-            Some("copy") => Some(Self::Copy_),
-            Some("clone") => Some(Self::Clone_),
+            Some("auto") => Some(GetTypeConf::Auto),
+            Some("ref") => Some(GetTypeConf::Ref),
+            Some("copy") => Some(GetTypeConf::Copy_),
+            Some("clone") => Some(GetTypeConf::Clone_),
             _ => return Err(SynError::new(span, "unreachable result")),
         };
         Ok(choice)
@@ -195,10 +283,26 @@ impl SetTypeConf {
     ) -> ParseResult<Option<Self>> {
         let choice = match namevalue_params.get("type").map(AsRef::as_ref) {
             None => None,
-            Some("ref") => Some(Self::Ref),
-            Some("own") => Some(Self::Own),
-            Some("none") => Some(Self::None_),
-            Some("replace") => Some(Self::Replace),
+            Some("ref") => Some(SetTypeConf::Ref),
+            Some("own") => Some(SetTypeConf::Own),
+            Some("none") => Some(SetTypeConf::None_),
+            Some("replace") => Some(SetTypeConf::Replace),
+            _ => return Err(SynError::new(span, "unreachable result")),
+        };
+        Ok(choice)
+    }
+}
+
+impl ClrScopeConf {
+    pub(crate) fn parse_from_input(
+        namevalue_params: &::std::collections::HashMap<&str, String>,
+        span: proc_macro2::Span,
+    ) -> ParseResult<Option<Self>> {
+        let choice = match namevalue_params.get("scope").map(AsRef::as_ref) {
+            None => None,
+            Some("auto") => Some(ClrScopeConf::Auto),
+            Some("option") => Some(ClrScopeConf::Option_),
+            Some("all") => Some(ClrScopeConf::All),
             _ => return Err(SynError::new(span, "unreachable result")),
         };
         Ok(choice)
@@ -212,10 +316,10 @@ impl VisibilityConf {
     ) -> ParseResult<Option<Self>> {
         let choice = match input {
             None => None,
-            Some("disable") => Some(Self::Disable),
-            Some("public") => Some(Self::Public),
-            Some("crate") => Some(Self::Crate),
-            Some("private") => Some(Self::Private),
+            Some("disable") => Some(VisibilityConf::Disable),
+            Some("public") => Some(VisibilityConf::Public),
+            Some("crate") => Some(VisibilityConf::Crate),
+            Some("private") => Some(VisibilityConf::Private),
             _ => return Err(SynError::new(span, "unreachable result")),
         };
         Ok(choice)
@@ -223,10 +327,10 @@ impl VisibilityConf {
 
     pub(crate) fn to_ts(self) -> Option<proc_macro2::TokenStream> {
         match self {
-            Self::Disable => None,
-            Self::Public => Some(quote!(pub)),
-            Self::Crate => Some(quote!(pub(crate))),
-            Self::Private => Some(quote!()),
+            VisibilityConf::Disable => None,
+            VisibilityConf::Public => Some(quote!(pub)),
+            VisibilityConf::Crate => Some(quote!(pub(crate))),
+            VisibilityConf::Private => Some(quote!()),
         }
     }
 }
@@ -238,8 +342,8 @@ impl SortTypeConf {
     ) -> ParseResult<Option<Self>> {
         let choice = match input {
             None => None,
-            Some("asc") => Some(Self::Ascending),
-            Some("desc") => Some(Self::Descending),
+            Some("asc") => Some(SortTypeConf::Ascending),
+            Some("desc") => Some(SortTypeConf::Descending),
             _ => return Err(SynError::new(span, "unreachable result")),
         };
         Ok(choice)
@@ -247,8 +351,8 @@ impl SortTypeConf {
 
     pub(crate) fn is_ascending(self) -> bool {
         match self {
-            Self::Ascending => true,
-            Self::Descending => false,
+            SortTypeConf::Ascending => true,
+            SortTypeConf::Descending => false,
         }
     }
 }
@@ -258,18 +362,9 @@ impl MethodNameConf {
         namevalue_params: &::std::collections::HashMap<&str, String>,
         span: proc_macro2::Span,
     ) -> ParseResult<Option<Self>> {
-        let name_opt = match namevalue_params.get("name") {
-            None => None,
-            Some(input) => Some(input.to_owned()),
-        };
-        let prefix_opt = match namevalue_params.get("prefix") {
-            None => None,
-            Some(input) => Some(input.to_owned()),
-        };
-        let suffix_opt = match namevalue_params.get("suffix") {
-            None => None,
-            Some(input) => Some(input.to_owned()),
-        };
+        let name_opt = namevalue_params.get("name").map(ToOwned::to_owned);
+        let prefix_opt = namevalue_params.get("prefix").map(ToOwned::to_owned);
+        let suffix_opt = namevalue_params.get("suffix").map(ToOwned::to_owned);
         if let Some(name) = name_opt {
             if prefix_opt.is_some() || suffix_opt.is_some() {
                 Err(SynError::new(
@@ -277,16 +372,16 @@ impl MethodNameConf {
                     "do not set prefix or suffix if name was set",
                 ))
             } else {
-                Ok(Some(Self::Name(name)))
+                Ok(Some(MethodNameConf::Name(name)))
             }
         } else {
             let choice = match (prefix_opt, suffix_opt) {
-                (Some(prefix), Some(suffix)) => Some(Self::Format { prefix, suffix }),
-                (Some(prefix), None) => Some(Self::Format {
+                (Some(prefix), Some(suffix)) => Some(MethodNameConf::Format { prefix, suffix }),
+                (Some(prefix), None) => Some(MethodNameConf::Format {
                     prefix,
                     suffix: "".to_owned(),
                 }),
-                (None, Some(suffix)) => Some(Self::Format {
+                (None, Some(suffix)) => Some(MethodNameConf::Format {
                     prefix: "".to_owned(),
                     suffix,
                 }),
@@ -298,8 +393,8 @@ impl MethodNameConf {
 
     pub(crate) fn complete(&self, field_name: &syn::Ident) -> syn::Ident {
         let method_name = match self {
-            Self::Name(ref name) => name.to_owned(),
-            Self::Format { prefix, suffix } => {
+            MethodNameConf::Name(ref name) => name.to_owned(),
+            MethodNameConf::Format { prefix, suffix } => {
                 format!("{}{}{}", prefix, field_name.to_string(), suffix)
             }
         };
@@ -312,58 +407,53 @@ impl OrdFieldConf {
         path_params: &::std::collections::HashSet<&syn::Path>,
         options: &[&'a str],
         span: proc_macro2::Span,
-        is_field: bool,
+        prop_type: PropertyType,
     ) -> ParseResult<(Option<&'a str>, Option<usize>)> {
         let mut sort_type = None;
         let mut number_opt = None;
         for p in path_params.iter() {
-            match p
+            let s = p
                 .get_ident()
                 .ok_or_else(|| SynError::new(p.span(), "this attribute should be a single ident"))?
-                .to_string()
-                .as_str()
-            {
-                t if options.iter().any(|opt| *opt == t) => {
-                    if sort_type.is_some() {
-                        return Err(SynError::new(
-                            p.span(),
-                            "this kind of attribute has been set twice",
-                        ));
-                    }
-                    for opt in options.iter() {
-                        if *opt == t {
-                            sort_type = Some(*opt);
-                            break;
-                        }
+                .to_string();
+            if options.iter().any(|opt| *opt == s.as_str()) {
+                if sort_type.is_some() {
+                    return Err(SynError::new(
+                        p.span(),
+                        "this kind of attribute has been set twice",
+                    ));
+                }
+                for opt in options.iter() {
+                    if *opt == s.as_str() {
+                        sort_type = Some(*opt);
+                        break;
                     }
                 }
-                n if &n.as_bytes()[..1] == b"_" => {
-                    if !is_field {
+            } else if &s.as_bytes()[..1] == b"_" {
+                if prop_type != PropertyType::Field {
+                    return Err(SynError::new(
+                        p.span(),
+                        "the serial number could not be set as a crate or container attribute",
+                    ));
+                } else if let Ok(n) = s.as_str()[1..].parse::<usize>() {
+                    if number_opt.is_some() {
                         return Err(SynError::new(
                             p.span(),
-                            "the serial number could not be set as a container attribute",
-                        ));
-                    } else if let Ok(n) = n[1..].parse::<usize>() {
-                        if number_opt.is_some() {
-                            return Err(SynError::new(
-                                p.span(),
-                                "the serial number has been set twice",
-                            ));
-                        }
-                        number_opt = Some(n);
-                    } else {
-                        return Err(SynError::new(
-                            p.span(),
-                            "the serial number should be an unsigned number with a `_` prefix",
+                            "the serial number has been set twice",
                         ));
                     }
+                    number_opt = Some(n);
+                } else {
+                    return Err(SynError::new(
+                        p.span(),
+                        "the serial number should be an unsigned number with a `_` prefix",
+                    ));
                 }
-                _ => {
-                    return Err(SynError::new(p.span(), "this attribute was unknown"));
-                }
+            } else {
+                return Err(SynError::new(p.span(), "this attribute was unknown"));
             }
         }
-        if is_field && number_opt.is_none() {
+        if prop_type == PropertyType::Field && number_opt.is_none() {
             Err(SynError::new(span, "no serial number was set"))
         } else {
             Ok((sort_type, number_opt))
@@ -380,7 +470,7 @@ impl ::std::default::Default for FieldConf {
                     prefix: "".to_owned(),
                     suffix: "".to_owned(),
                 },
-                typ: GetTypeConf::NotSet,
+                typ: GetTypeConf::Auto,
             },
             set: SetFieldConf {
                 vis: VisibilityConf::Crate,
@@ -389,7 +479,7 @@ impl ::std::default::Default for FieldConf {
                     suffix: "".to_owned(),
                 },
                 typ: SetTypeConf::Ref,
-                strip_option: false,
+                full_option: false,
             },
             mut_: MutFieldConf {
                 vis: VisibilityConf::Crate,
@@ -397,6 +487,14 @@ impl ::std::default::Default for FieldConf {
                     prefix: "mut_".to_owned(),
                     suffix: "".to_owned(),
                 },
+            },
+            clr: ClrFieldConf {
+                vis: VisibilityConf::Crate,
+                name: MethodNameConf::Format {
+                    prefix: "clear_".to_owned(),
+                    suffix: "".to_owned(),
+                },
+                scope: ClrScopeConf::Option_,
             },
             ord: OrdFieldConf {
                 number: None,
@@ -408,18 +506,11 @@ impl ::std::default::Default for FieldConf {
 }
 
 impl FieldConf {
-    fn apply_attrs(&mut self, meta: &syn::Meta, is_field: bool) -> ParseResult<()> {
+    fn apply_attrs(&mut self, meta: &syn::Meta, prop_type: PropertyType) -> ParseResult<()> {
         match meta {
             syn::Meta::Path(path) => {
                 if path.is_ident(SKIP) {
-                    if is_field {
-                        self.skip = true;
-                    } else {
-                        return Err(SynError::new(
-                            path.span(),
-                            "don't derive it, rather than use skip as a container attribute",
-                        ));
-                    }
+                    self.skip = true;
                 } else {
                     return Err(SynError::new(path.span(), "this attribute was unknown"));
                 }
@@ -507,7 +598,10 @@ impl FieldConf {
                         }
                     }
                     "set" => {
-                        let paths = check_path_params(&path_params, &[VISIBILITY_OPTIONS, STRIP_OPTION])?;
+                        let paths = check_path_params(
+                            &path_params,
+                            &[VISIBILITY_OPTIONS, SET_OPTION_FULL_OPTION],
+                        )?;
                         let namevalues = check_namevalue_params(
                             &namevalue_params,
                             &[NAME_OPTION, PREFIX_OPTION, SUFFIX_OPTION, SET_TYPE_OPTIONS],
@@ -517,6 +611,7 @@ impl FieldConf {
                         {
                             self.set.vis = choice;
                         }
+                        self.set.full_option = paths[1].is_some();
                         if let Some(choice) =
                             MethodNameConf::parse_from_input(&namevalues, list.path.span())?
                         {
@@ -546,12 +641,34 @@ impl FieldConf {
                             self.mut_.name = choice;
                         }
                     }
+                    "clr" => {
+                        let paths = check_path_params(&path_params, &[VISIBILITY_OPTIONS])?;
+                        let namevalues = check_namevalue_params(
+                            &namevalue_params,
+                            &[NAME_OPTION, PREFIX_OPTION, SUFFIX_OPTION, CLR_TYPE_OPTIONS],
+                        )?;
+                        if let Some(choice) =
+                            VisibilityConf::parse_from_input(paths[0], list.path.span())?
+                        {
+                            self.mut_.vis = choice;
+                        }
+                        if let Some(choice) =
+                            MethodNameConf::parse_from_input(&namevalues, list.path.span())?
+                        {
+                            self.mut_.name = choice;
+                        }
+                        if let Some(choice) =
+                            ClrScopeConf::parse_from_input(&namevalues, list.path.span())?
+                        {
+                            self.clr.scope = choice;
+                        }
+                    }
                     "ord" => {
                         let (sort_type_opt, number_opt) = OrdFieldConf::parse_from_path_params(
                             &path_params,
                             SORT_TYPE_OPTIONS,
                             list.path.span(),
-                            is_field,
+                            prop_type,
                         )?;
                         if let Some(choice) =
                             SortTypeConf::parse_from_input(sort_type_opt, list.path.span())?
@@ -652,7 +769,7 @@ fn parse_attrs(
     span: proc_macro2::Span,
     mut conf: FieldConf,
     attrs: &[syn::Attribute],
-    is_field: bool,
+    prop_type: PropertyType,
 ) -> ParseResult<FieldConf> {
     for attr in attrs.iter() {
         if let syn::AttrStyle::Outer = attr.style {
@@ -677,17 +794,7 @@ fn parse_attrs(
                             ));
                         }
                         for nested_meta in list.nested.iter() {
-                            match nested_meta {
-                                syn::NestedMeta::Meta(meta) => {
-                                    conf.apply_attrs(meta, is_field)?;
-                                }
-                                syn::NestedMeta::Lit(lit) => {
-                                    return Err(SynError::new(
-                                        lit.span(),
-                                        "the attribute in nested meta should not be a literal",
-                                    ));
-                                }
-                            }
+                            parse_nested_meta(&mut conf, nested_meta, prop_type)?;
                         }
                     }
                 }
@@ -703,4 +810,21 @@ fn parse_attrs(
         }
     }
     Ok(conf)
+}
+
+fn parse_nested_meta(
+    conf: &mut FieldConf,
+    nested_meta: &syn::NestedMeta,
+    prop_type: PropertyType,
+) -> ParseResult<()> {
+    match nested_meta {
+        syn::NestedMeta::Meta(meta) => {
+            conf.apply_attrs(meta, prop_type)?;
+            Ok(())
+        }
+        syn::NestedMeta::Lit(lit) => Err(SynError::new(
+            lit.span(),
+            "the attribute in nested meta should not be a literal",
+        )),
+    }
 }

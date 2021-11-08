@@ -1,30 +1,53 @@
 # Rust-Property
 
 [![License]](#license)
-[![Travis CI]](https://travis-ci.com/yangby-cryptape/rust-property)
+[![GitHub Actions]](https://github.com/yangby-cryptape/rust-property/actions)
 [![Crate Badge]](https://crates.io/crates/property)
 [![Crate Doc]](https://docs.rs/property)
+[![MSRV 1.31.0]][Rust 1.31.0]
 
 Generate several common methods for structs automatically.
 
 [License]: https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue.svg
-[Travis CI]: https://img.shields.io/travis/com/yangby-cryptape/rust-property.svg
+[GitHub Actions]: https://github.com/yangby-cryptape/rust-property/workflows/CI/badge.svg
 [Crate Badge]: https://img.shields.io/crates/v/property.svg
 [Crate Doc]: https://docs.rs/property/badge.svg
+[MSRV 1.31.0]: https://img.shields.io/badge/rust-%3E%3D%201.31.0-blue
 
 ## Usage
 
-- Apply the derive proc-macro `#[derive(Property)]` to structs, and use `#[property(..)]` to configure it.
+Apply the derive proc-macro `#[derive(Property)]` to structs, and use `#[property(..)]` to configure it.
 
-  There are five kinds of configurable attributes: `skip`, `get`, `set`, `mut` and `ord`.
+There are three levels of properties:
 
-- Set container attributes can change the default settings for all fields.
+- Set crate properties can change the default settings for all containers (structs) in the whole crate.
 
-- Change the settings of a single field via setting field attributes.
+  Limited by the procedural macros, here we have to use a tricky way to set the crate properties:
 
-- If the `skip` attribute is set, no methods will be generated.
+  ```rust
+  #[property_default(get(..), set(..), ..)]
+  struct PropertyCrateConf; // This struct is only used for introducing the attribute macro, and it will be removed in the macro.
+  ```
 
-  Don't set `skip` attribute as a container attribute.
+- Set container properties can change the default properties for all fields in the container.
+
+- Change the settings of a single field via setting field properties.
+
+If no properties is set, the default properties will be applied:
+
+```rust
+#[property(
+    get(crate, prefix = "", suffix = "", type="auto"),
+    set(crate, prefix = "set_", type = "ref"),
+    mut(crate, prefix = "mut_"),
+    clr(crate, prefix = "clear_", scope = "option")
+    ord(asc)
+)]
+```
+
+There are six kinds of configurable properties: `skip`, `get`, `set`, `mut`, `clr` and `ord`.
+
+- If the `skip` property is set, no methods will be generated.
 
 - The visibility of a method can be set via `#[property(get(visibility-type))]`
 
@@ -40,7 +63,7 @@ Generate several common methods for structs automatically.
 
 - The return type of `get` method can be set via `#[property(get(type = "return-type"))]`.
 
-  There are three kinds of the return types: `ref` (default in most cases), `clone` and `copy`.
+  There are four kinds of the return types: `auto` (default), `ref`, `clone` and `copy`.
 
 - The input type and return type of `set` method can be set via `#[property(set(type = "set-type"))]`.
 
@@ -54,15 +77,25 @@ Generate several common methods for structs automatically.
 
   - `replace`: input is a mutable reference and return the old value.
 
-- ``#[property(set(strip_option))]` accepts `T` as property value instead of `Option<T>`
+- There is an extra property for `set` method:
 
-- If there are more than one filed have the `ord` attribute, the [`PartialEq`] and [`PartialOrd`] will be implemented automatically.
+  - `full_option`: if the value is `Option<T>`, then the default argument is `T` without this property.
 
-  - A serial number is required for the `ord` field attribute, it's an unsigned number with a `_` prefix.
+- The `clr` method will set a field to its default value. It has a `scope` property:
+
+  - `auto`: will generate `clr` method for some preset types, such as `Vec`, `Option`, and so on.
+
+  - `option`: (default) will generate `clr` method for `Option` only.
+
+  - `all`: will generate `clr` method for all types.
+
+- If there are more than one filed have the `ord` property, the [`PartialEq`] and [`PartialOrd`] will be implemented automatically.
+
+  - A serial number is required for the `ord` field property, it's an unsigned number with a `_` prefix.
 
     The serial numbers could be noncontinuous, but any two number of these could not be equal.
 
-    No serial number is allowed if the `ord` attribute is a container attribute.
+    No serial number is allowed if the `ord` property is a container property.
 
   - There are two kind of sort types: `asc` and `desc`.
 
@@ -78,11 +111,18 @@ Generate several common methods for structs automatically.
 ```rust
 #![no_std]
 
+#[cfg(not(feature = "std"))]
 extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std as alloc;
 
 use alloc::{string::String, vec::Vec};
 
-use property::Property;
+use property::{property_default, Property};
+
+#[property_default(get(public), ord(desc), clr(scope = "option"))]
+struct PropertyCrateConf;
 
 #[derive(Copy, Clone)]
 pub enum Species {
@@ -93,7 +133,7 @@ pub enum Species {
 }
 
 #[derive(Property)]
-#[property(get(public), set(private), mut(disable), ord(desc))]
+#[property(set(private), mut(disable))]
 pub struct Pet {
     #[property(get(name = "identification"), set(disable), ord(asc, _2))]
     id: [u8; 32],
@@ -106,6 +146,7 @@ pub struct Pet {
     died: bool,
     #[property(get(type = "clone"), set(type = "none"))]
     owner: String,
+    #[property(clr(scope = "auto"))]
     family_members: Vec<String>,
     #[property(get(type = "ref"), mut(crate))]
     info: String,
@@ -113,7 +154,7 @@ pub struct Pet {
     pub tag: Vec<String>,
     #[property(mut(public, suffix = "_mut"), set(strip_option))]
     note: Option<String>,
-    #[property(set(type = "replace"))]
+    #[property(set(type = "replace", full_option))]
     price: Option<u32>,
     #[property(skip)]
     pub reserved: String,
@@ -185,6 +226,10 @@ impl Pet {
         self
     }
     #[inline]
+    pub(crate) fn clear_family_members(&mut self) {
+        self.family_members.clear();
+    }
+    #[inline]
     pub fn info(&self) -> &String {
         &self.info
     }
@@ -215,12 +260,20 @@ impl Pet {
         &mut self.note
     }
     #[inline]
+    pub(crate) fn clear_note(&mut self) {
+        self.note = None;
+    }
+    #[inline]
     pub fn price(&self) -> Option<u32> {
         self.price
     }
     #[inline]
     fn set_price<T: Into<Option<u32>>>(&mut self, val: T) -> Option<u32> {
         ::core::mem::replace(&mut self.price, val.into())
+    }
+    #[inline]
+    pub(crate) fn clear_price(&mut self) {
+        self.price = None;
     }
 }
 impl PartialEq for Pet {
@@ -249,10 +302,14 @@ impl PartialOrd for Pet {
 
 Enjoy it!
 
+## Minimum Supported Rust Version
+
+[Rust 1.31.0].
+
 ## License
 
-Licensed under either of [Apache License, Version 2.0] or [MIT License], at
-your option.
+Licensed under either of [Apache License, Version 2.0] or [MIT License], at your option.
 
 [Apache License, Version 2.0]: LICENSE-APACHE
 [MIT License]: LICENSE-MIT
+[Rust 1.31.0]: https://blog.rust-lang.org/2018/12/06/Rust-1.31-and-rust-2018.html
